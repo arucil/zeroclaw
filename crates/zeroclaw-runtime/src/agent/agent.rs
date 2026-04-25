@@ -1134,6 +1134,7 @@ impl Agent {
             );
 
             let mut streamed_text = String::new();
+            let mut streamed_reasoning = String::new();
             let mut streamed_tool_calls: Vec<zeroclaw_providers::traits::ToolCall> = Vec::new();
             let mut got_stream = false;
             let mut pre_executed_call_ids: HashMap<String, VecDeque<String>> = HashMap::new();
@@ -1166,6 +1167,7 @@ impl Agent {
                             if let Some(reasoning) = chunk.reasoning
                                 && !reasoning.is_empty()
                             {
+                                streamed_reasoning.push_str(&reasoning);
                                 let _ = event_tx
                                     .send(TurnEvent::Thinking { delta: reasoning })
                                     .await;
@@ -1244,12 +1246,19 @@ impl Agent {
             // If streaming produced text, use it as the response and
             // check for tool calls via the dispatcher.
             let response = if got_stream {
-                // Build a synthetic ChatResponse from streamed text
+                // Build a synthetic ChatResponse from streamed text.
+                // Preserve reasoning deltas so providers like Kimi K2.6 / DeepSeek V4
+                // that require `reasoning_content` round-trip in tool-call history
+                // do not reject subsequent requests with 400 Bad Request.
                 zeroclaw_providers::ChatResponse {
                     text: Some(streamed_text),
                     tool_calls: streamed_tool_calls,
                     usage: None,
-                    reasoning_content: None,
+                    reasoning_content: if streamed_reasoning.is_empty() {
+                        None
+                    } else {
+                        Some(streamed_reasoning)
+                    },
                 }
             } else {
                 // Fall back to non-streaming chat, with cancellation guard

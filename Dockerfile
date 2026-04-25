@@ -1,4 +1,4 @@
-# syntax=docker/dockerfile:1.7
+# syntax=docker/dockerfile:1.7-labs
 
 # ── Stage 0: Frontend build ─────────────────────────────────────
 FROM node:22-alpine AS web-builder
@@ -48,11 +48,12 @@ RUN --mount=type=cache,id=zeroclaw-cargo-registry,target=/usr/local/cargo/regist
     else \
       cargo build --release --locked; \
     fi
-RUN rm -rf src benches
+RUN rm -rf src benches crates
 
 # 2. Copy only build-relevant source paths (avoid cache-busting on docs/tests/scripts)
 COPY src/ src/
 COPY benches/ benches/
+COPY crates/ crates/
 COPY *.rs .
 RUN touch src/main.rs
 RUN --mount=type=cache,id=zeroclaw-cargo-registry,target=/usr/local/cargo/registry,sharing=locked \
@@ -60,7 +61,10 @@ RUN --mount=type=cache,id=zeroclaw-cargo-registry,target=/usr/local/cargo/regist
     --mount=type=cache,id=zeroclaw-target,target=/app/target,sharing=locked \
     rm -rf target/release/.fingerprint/zeroclawlabs-* \
            target/release/deps/zeroclawlabs-* \
-           target/release/incremental/zeroclawlabs-* && \
+           target/release/incremental/zeroclawlabs-* \
+           target/release/.fingerprint/zeroclaw-* \
+           target/release/deps/zeroclaw_* \
+           target/release/incremental/zeroclaw_* && \
     if [ -n "$ZEROCLAW_CARGO_FEATURES" ]; then \
       cargo build --release --locked --features "$ZEROCLAW_CARGO_FEATURES"; \
     else \

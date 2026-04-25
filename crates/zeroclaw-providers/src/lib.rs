@@ -1257,12 +1257,15 @@ fn create_provider_with_url_and_options(
             key,
             AuthStyle::Bearer,
         ))),
-        name if moonshot_base_url(name).is_some() => Ok(compat(OpenAiCompatibleProvider::new(
-            "Moonshot",
-            moonshot_base_url(name).expect("checked in guard"),
-            key,
-            AuthStyle::Bearer,
-        ))),
+        name if moonshot_base_url(name).is_some() => {
+            Ok(compat(OpenAiCompatibleProvider::new_with_vision(
+                "Moonshot",
+                moonshot_base_url(name).expect("checked in guard"),
+                key,
+                AuthStyle::Bearer,
+                true,
+            )))
+        }
         "kimi-code" | "kimi_coding" | "kimi_for_coding" => {
             Ok(compat(OpenAiCompatibleProvider::new_with_user_agent(
                 "Kimi Code",

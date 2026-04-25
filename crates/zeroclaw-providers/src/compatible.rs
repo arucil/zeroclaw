@@ -1489,9 +1489,35 @@ impl OpenAiCompatibleProvider {
         MessageContent::Parts(parts)
     }
 
+    /// Some providers reject assistant tool-call history if the
+    /// `reasoning_content` field is missing when thinking mode is enabled.
+    /// Detected by provider name and base URL.
+    fn requires_reasoning_content_for_tool_history(&self) -> bool {
+        let name = self.name.to_ascii_lowercase();
+        let base = self.base_url.to_ascii_lowercase();
+        name == "kimi code"
+            || name == "kimi-code"
+            || name == "moonshot"
+            || name == "moonshot-intl"
+            || name == "moonshot-cn"
+            || name == "kimi"
+            || name == "kimi-intl"
+            || name == "kimi-global"
+            || name == "kimi-cn"
+            || name == "deepseek"
+            || name == "glm"
+            || name == "zhipu"
+            || base.contains("api.kimi.com/coding")
+            || base.contains("api.moonshot.ai")
+            || base.contains("api.moonshot.cn")
+            || base.contains("api.deepseek.com")
+            || base.contains("open.bigmodel.cn")
+    }
+
     fn convert_messages_for_native(
         messages: &[ChatMessage],
         allow_user_image_parts: bool,
+        require_reasoning_for_tool_history: bool,
     ) -> Vec<NativeMessage> {
         messages
             .iter()
@@ -1522,10 +1548,14 @@ impl OpenAiCompatibleProvider {
                         .and_then(serde_json::Value::as_str)
                         .map(|value| MessageContent::Text(value.to_string()));
 
-                    let reasoning_content = value
+                    let mut reasoning_content = value
                         .get("reasoning_content")
                         .and_then(serde_json::Value::as_str)
                         .map(ToString::to_string);
+
+                    if require_reasoning_for_tool_history && reasoning_content.is_none() {
+                        reasoning_content = Some(String::new());
+                    }
 
                     return NativeMessage {
                         role: "assistant".to_string(),
@@ -2082,7 +2112,11 @@ impl Provider for OpenAiCompatibleProvider {
         let effective_messages = self.strip_native_tool_messages(&effective_messages);
         let native_request = NativeChatRequest {
             model: model.to_string(),
-            messages: Self::convert_messages_for_native(&effective_messages, !merge),
+            messages: Self::convert_messages_for_native(
+                &effective_messages,
+                !merge,
+                self.requires_reasoning_content_for_tool_history(),
+            ),
             temperature,
             stream: Some(false),
             reasoning_effort: self.reasoning_effort_for_model(model),
@@ -2220,7 +2254,11 @@ impl Provider for OpenAiCompatibleProvider {
         let payload = if has_tools {
             serde_json::to_value(NativeChatRequest {
                 model: model.to_string(),
-                messages: Self::convert_messages_for_native(&effective_messages, !merge),
+                messages: Self::convert_messages_for_native(
+                    &effective_messages,
+                    !merge,
+                    self.requires_reasoning_content_for_tool_history(),
+                ),
                 temperature,
                 reasoning_effort: self.reasoning_effort.clone(),
                 tool_stream: if options.enabled {
@@ -3125,7 +3163,7 @@ mod tests {
             r#"{"tool_call_id":"call_abc","content":"done"}"#,
         )];
 
-        let converted = OpenAiCompatibleProvider::convert_messages_for_native(&input, true);
+        let converted = OpenAiCompatibleProvider::convert_messages_for_native(&input, true, false);
         assert_eq!(converted.len(), 1);
         assert_eq!(converted[0].role, "tool");
         assert_eq!(converted[0].tool_call_id.as_deref(), Some("call_abc"));
@@ -3141,7 +3179,7 @@ mod tests {
             "System primer [IMAGE:data:image/png;base64,abcd] user turn",
         )];
 
-        let converted = OpenAiCompatibleProvider::convert_messages_for_native(&input, false);
+        let converted = OpenAiCompatibleProvider::convert_messages_for_native(&input, false, false);
         assert_eq!(converted.len(), 1);
         assert_eq!(converted[0].role, "user");
         assert!(matches!(
@@ -4073,7 +4111,7 @@ mod tests {
         });
 
         let messages = vec![ChatMessage::assistant(history_json.to_string())];
-        let native = OpenAiCompatibleProvider::convert_messages_for_native(&messages, true);
+        let native = OpenAiCompatibleProvider::convert_messages_for_native(&messages, true, false);
         assert_eq!(native.len(), 1);
         assert_eq!(native[0].role, "assistant");
         assert_eq!(
@@ -4096,7 +4134,7 @@ mod tests {
         });
 
         let messages = vec![ChatMessage::assistant(history_json.to_string())];
-        let native = OpenAiCompatibleProvider::convert_messages_for_native(&messages, true);
+        let native = OpenAiCompatibleProvider::convert_messages_for_native(&messages, true, false);
         assert_eq!(native.len(), 1);
         assert!(native[0].reasoning_content.is_none());
     }

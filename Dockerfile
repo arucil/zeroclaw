@@ -32,13 +32,21 @@ COPY --parents crates/*/Cargo.toml ./
 COPY --parents crates/aardvark-sys/build.rs ./
 # apps/tauri: .dockerignore whitelists only Cargo.toml; src and build.rs are stubbed below.
 COPY apps/tauri/Cargo.toml apps/tauri/Cargo.toml
+# Additional workspace members beyond crates/ and apps/.
+COPY tools/fill-translations/Cargo.toml tools/fill-translations/Cargo.toml
+COPY xtask/Cargo.toml xtask/Cargo.toml
 # Create dummy targets for all workspace members so manifest parsing succeeds.
 RUN mkdir -p src benches apps/tauri/src \
+        tools/fill-translations/src xtask/src/bin \
     && echo "fn main() {}" > src/main.rs \
     && echo "" > src/lib.rs \
     && echo "fn main() {}" > benches/agent_benchmarks.rs \
     && echo "fn main() {}" > apps/tauri/src/main.rs \
     && echo "fn main() {}" > apps/tauri/build.rs \
+    && echo "fn main() {}" > tools/fill-translations/src/main.rs \
+    && echo "" > xtask/src/lib.rs \
+    && echo "fn main() {}" > xtask/src/bin/mdbook.rs \
+    && echo "fn main() {}" > xtask/src/bin/fluent.rs \
     && for d in crates/*/; do mkdir -p "${d}src" && printf '' > "${d}src/lib.rs"; done
 RUN --mount=type=cache,id=zeroclaw-cargo-registry,target=/usr/local/cargo/registry,sharing=locked \
     --mount=type=cache,id=zeroclaw-cargo-git,target=/usr/local/cargo/git,sharing=locked \
@@ -48,12 +56,14 @@ RUN --mount=type=cache,id=zeroclaw-cargo-registry,target=/usr/local/cargo/regist
     else \
       cargo build --release --locked; \
     fi
-RUN rm -rf src benches crates
+RUN rm -rf src benches crates xtask tools/fill-translations
 
 # 2. Copy only build-relevant source paths (avoid cache-busting on docs/tests/scripts)
 COPY src/ src/
 COPY benches/ benches/
 COPY crates/ crates/
+COPY xtask/ xtask/
+COPY tools/fill-translations/ tools/fill-translations/
 COPY *.rs .
 RUN touch src/main.rs
 RUN --mount=type=cache,id=zeroclaw-cargo-registry,target=/usr/local/cargo/registry,sharing=locked \

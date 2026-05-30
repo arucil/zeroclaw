@@ -757,7 +757,9 @@ impl CompatFamilySpec for MoonshotModelProviderConfig {
             return build_kimi_code_compat(alias, key, base_url);
         }
 
-        self.build_compat_base(alias, key, api_url)
+        // Kimi K2.6 multimodal accepts image_url content parts; enable vision so
+        // the multimodal vision_provider router can dispatch [IMAGE:] turns here.
+        self.build_compat_base(alias, key, api_url).vision(true)
     }
 }
 

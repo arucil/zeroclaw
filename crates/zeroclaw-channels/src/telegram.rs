@@ -18,6 +18,12 @@ const TELEGRAM_CONTINUES_SUFFIX: &str = "\n\n(continues...)";
 const TELEGRAM_FENCE_REOPEN: &str = "```\n";
 const TELEGRAM_FENCE_CLOSE: &str = "```";
 const TELEGRAM_ACK_REACTIONS: &[&str] = &["⚡️", "👌", "👀", "🔥", "👍"];
+/// Delay between consecutive chunks when a long reply is split across messages.
+/// Telegram throttles bots to ~20 messages/minute per chat; a long reply split
+/// into many chunks at a 100ms cadence trips HTTP 429 with a multi-minute
+/// `retry_after`, which drops the rest of the reply. Pace chunks ~1.5s apart so
+/// a 10+ chunk reply stays under the per-minute ceiling.
+const TELEGRAM_INTER_CHUNK_DELAY: Duration = Duration::from_millis(1500);
 
 /// Metadata for an incoming document or photo attachment.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2599,7 +2605,7 @@ Allowlist Telegram username (without '@') or numeric user ID.",
 
             if markdown_resp.status().is_success() {
                 if index < chunks.len() - 1 {
-                    tokio::time::sleep(Duration::from_millis(100)).await;
+                    tokio::time::sleep(TELEGRAM_INTER_CHUNK_DELAY).await;
                 }
                 continue;
             }
@@ -2643,7 +2649,7 @@ Allowlist Telegram username (without '@') or numeric user ID.",
             }
 
             if index < chunks.len() - 1 {
-                tokio::time::sleep(Duration::from_millis(100)).await;
+                tokio::time::sleep(TELEGRAM_INTER_CHUNK_DELAY).await;
             }
         }
 

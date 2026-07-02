@@ -11,8 +11,26 @@ pub fn create_runtime(config: &RuntimeConfig) -> anyhow::Result<Box<dyn RuntimeA
     match config.kind {
         RuntimeKind::Native => {
             let shell = config.shell.clone().unwrap_or_else(|| "sh".into());
+            // A missing shell must not abort runtime construction: on the
+            // distroless release image there is no shell at all, yet the
+            // daemon (channels, cron, gateway) is fully functional without
+            // the shell tool. Fail fast only when the operator explicitly
+            // configured a shell; fall back to a warning for the implicit
+            // "sh" default so shell-less deployments keep working (the shell
+            // tool itself errors on invocation, matching pre-0.8.2 behavior).
             #[cfg(unix)]
-            validate_shell(&shell)?;
+            if let Err(e) = validate_shell(&shell) {
+                if config.shell.is_some() {
+                    return Err(e);
+                }
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                        .with_attrs(::serde_json::json!({"shell": shell, "error": format!("{e}")})),
+                    "runtime.shell default unavailable; shell tool disabled for this runtime"
+                );
+            }
             #[cfg(windows)]
             validate_shell_windows(&shell)?;
             Ok(Box::new(NativeRuntime::with_shell(shell)))

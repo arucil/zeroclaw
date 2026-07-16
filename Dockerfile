@@ -22,6 +22,8 @@ FROM --platform=$BUILDPLATFORM ${ZEROCLAW_BASE_NODE} AS web-node
 
 FROM --platform=$BUILDPLATFORM ${ZEROCLAW_BASE_RUST_SLIM} AS web-builder
 WORKDIR /app
+# local: use rsproxy.cn crates mirror (direct crates.io is unusably slow here)
+RUN printf '[source.crates-io]\nreplace-with = "rsproxy-sparse"\n[source.rsproxy-sparse]\nregistry = "sparse+https://rsproxy.cn/index/"\n' > /usr/local/cargo/config.toml
 COPY --from=web-node /usr/local/bin/node /usr/local/bin/node
 COPY --from=web-node /usr/local/lib/node_modules /usr/local/lib/node_modules
 RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
@@ -52,6 +54,8 @@ FROM --platform=$BUILDPLATFORM ${ZEROCLAW_BASE_RUST_SLIM} AS builder
 
 WORKDIR /app
 ARG TARGETARCH
+# local: use rsproxy.cn crates mirror (direct crates.io is unusably slow here)
+RUN printf '[source.crates-io]\nreplace-with = "rsproxy-sparse"\n[source.rsproxy-sparse]\nregistry = "sparse+https://rsproxy.cn/index/"\n' > /usr/local/cargo/config.toml
 # >>> generated:docker-features-arg by `cargo generate installers` - do not edit <<<
 ARG ZEROCLAW_CARGO_FLAGS="--no-default-features --features acp-bridge,agent-runtime,channel-acp-server,channel-discord,channel-email,channel-filesystem,channel-lark,channel-matrix,channel-telegram,channel-webhook,gateway,observability-prometheus,schema-export,whatsapp-web"
 # >>> end generated:docker-features-arg <<<

@@ -611,11 +611,14 @@ pub struct TelegramChannel {
     approval_timeout_secs: u64,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 enum EditMessageResult {
     Success,
     NotModified,
-    Failed(reqwest::StatusCode),
+    Failed {
+        status: reqwest::StatusCode,
+        body: String,
+    },
 }
 
 /// Outcome of attempting to parse a single incoming Telegram update.
@@ -1545,7 +1548,51 @@ impl TelegramChannel {
             return EditMessageResult::NotModified;
         }
 
-        EditMessageResult::Failed(status)
+        EditMessageResult::Failed { status, body }
+    }
+
+    /// Remove a draft only after all replacement content has been delivered.
+    /// A cleanup failure is non-fatal because the final reply is already visible;
+    /// retaining a stale draft is safer than turning a delivery failure into data loss.
+    async fn delete_draft_after_replacement(&self, chat_id: &str, message_id: i64) {
+        let delete_resp = self
+            .client
+            .post(self.api_url("deleteMessage"))
+            .json(&serde_json::json!({
+                "chat_id": chat_id,
+                "message_id": message_id,
+            }))
+            .send()
+            .await;
+
+        match delete_resp {
+            Ok(resp) if resp.status().is_success() => {}
+            Ok(resp) => {
+                let status = resp.status();
+                let body = resp.text().await.unwrap_or_default();
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                        .with_attrs(::serde_json::json!({
+                            "status": status.to_string(),
+                            "error": zeroclaw_runtime::security::scrub(&body),
+                        })),
+                    "Telegram replacement delivered but finalized draft cleanup failed"
+                );
+            }
+            Err(err) => {
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                        .with_attrs(::serde_json::json!({
+                            "error": zeroclaw_runtime::security::scrub(&err.to_string()),
+                        })),
+                    "Telegram replacement delivered but finalized draft cleanup request failed"
+                );
+            }
+        }
     }
 
     async fn fetch_bot_username(&self) -> anyhow::Result<String> {
@@ -4096,23 +4143,9 @@ impl Channel for TelegramChannel {
             }
         };
 
-        // If we have attachments, delete the draft and send fresh messages
-        // (Telegram editMessageText can't add attachments)
+        // Telegram editMessageText can't add attachments. Deliver every
+        // replacement first so a media/text failure cannot erase the draft.
         if !attachments.is_empty() {
-            // Delete the draft message
-            if let Some(id) = msg_id {
-                let _ = self
-                    .client
-                    .post(self.api_url("deleteMessage"))
-                    .json(&serde_json::json!({
-                        "chat_id": chat_id,
-                        "message_id": id,
-                    }))
-                    .send()
-                    .await;
-            }
-
-            // Send text without markers
             if !text_without_markers.is_empty() {
                 self.send_text_chunks(&text_without_markers, &chat_id, thread_id.as_deref())
                     .await?;
@@ -4124,27 +4157,24 @@ impl Channel for TelegramChannel {
                     .await?;
             }
 
+            if let Some(id) = msg_id {
+                self.delete_draft_after_replacement(&chat_id, id).await;
+            }
+
             return Ok(());
         }
 
-        // If text exceeds limit, delete draft and send as chunked messages
+        // If text exceeds the limit, deliver every chunk before removing the
+        // draft. A failed chunk send leaves the existing draft visible.
         if text.len() > TELEGRAM_MAX_MESSAGE_LENGTH {
+            self.send_text_chunks(text, &chat_id, thread_id.as_deref())
+                .await?;
+
             if let Some(id) = msg_id {
-                let _ = self
-                    .client
-                    .post(self.api_url("deleteMessage"))
-                    .json(&serde_json::json!({
-                        "chat_id": chat_id,
-                        "message_id": id,
-                    }))
-                    .send()
-                    .await;
+                self.delete_draft_after_replacement(&chat_id, id).await;
             }
 
-            // Fall back to chunked send
-            return self
-                .send_text_chunks(text, &chat_id, thread_id.as_deref())
-                .await;
+            return Ok(());
         }
 
         let Some(id) = msg_id else {
@@ -4170,11 +4200,14 @@ impl Channel for TelegramChannel {
 
         match Self::classify_edit_message_response(resp).await {
             EditMessageResult::Success | EditMessageResult::NotModified => return Ok(()),
-            EditMessageResult::Failed(status) => {
+            EditMessageResult::Failed { status, body } => {
                 ::zeroclaw_log::record!(
                     DEBUG,
                     ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                        .with_attrs(::serde_json::json!({"status": status.to_string()})),
+                        .with_attrs(::serde_json::json!({
+                            "status": status.to_string(),
+                            "error": zeroclaw_runtime::security::scrub(&body),
+                        })),
                     "Telegram finalize_draft HTML edit failed; retrying without parse_mode"
                 );
             }
@@ -4196,53 +4229,24 @@ impl Channel for TelegramChannel {
 
         match Self::classify_edit_message_response(resp).await {
             EditMessageResult::Success | EditMessageResult::NotModified => return Ok(()),
-            EditMessageResult::Failed(status) => {
+            EditMessageResult::Failed { status, body } => {
                 ::zeroclaw_log::record!(
                     WARN,
                     ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
                         .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
-                        .with_attrs(::serde_json::json!({"status": status.to_string()})),
-                    "Telegram finalize_draft plain edit failed; attempting delete+send fallback"
+                        .with_attrs(::serde_json::json!({
+                            "status": status.to_string(),
+                            "error": zeroclaw_runtime::security::scrub(&body),
+                        })),
+                    "Telegram finalize_draft plain edit failed; sending replacement before draft cleanup"
                 );
             }
         }
 
-        let delete_resp = self
-            .client
-            .post(self.api_url("deleteMessage"))
-            .json(&serde_json::json!({
-                "chat_id": chat_id,
-                "message_id": id,
-            }))
-            .send()
-            .await;
-
-        match delete_resp {
-            Ok(resp) if resp.status().is_success() => {
-                self.send_text_chunks(text, &chat_id, thread_id.as_deref())
-                    .await
-            }
-            Ok(resp) => {
-                ::zeroclaw_log::record!(
-                    WARN,
-                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
-                        .with_attrs(::serde_json::json!({"status": resp.status().to_string()})),
-                    "Telegram finalize_draft delete failed; skipping sendMessage to avoid duplicate"
-                );
-                Ok(())
-            }
-            Err(err) => {
-                ::zeroclaw_log::record!(
-                    WARN,
-                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
-                        .with_attrs(::serde_json::json!({"err": err.to_string()})),
-                    "Telegram finalize_draft delete request failed: ; skipping sendMessage to avoid duplicate"
-                );
-                Ok(())
-            }
-        }
+        self.send_text_chunks(text, &chat_id, thread_id.as_deref())
+            .await?;
+        self.delete_draft_after_replacement(&chat_id, id).await;
+        Ok(())
     }
 
     async fn cancel_draft(&self, recipient: &str, message_id: &str) -> anyhow::Result<()> {
@@ -5395,6 +5399,233 @@ mod tests {
             .finalize_draft("123", "not-a-number", &long_text, false)
             .await;
         assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn finalize_draft_delivers_replacement_before_deleting_uneditable_draft() {
+        use wiremock::matchers::{method, path_regex};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock_server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path_regex(r"/bot[^/]+/editMessageText$"))
+            .respond_with(ResponseTemplate::new(400).set_body_json(serde_json::json!({
+                "ok": false,
+                "description": "Bad Request: message can't be edited"
+            })))
+            .expect(2)
+            .mount(&mock_server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path_regex(r"/bot[^/]+/sendMessage$"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "ok": true,
+                "result": { "message_id": 43 }
+            })))
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path_regex(r"/bot[^/]+/deleteMessage$"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "ok": true,
+                "result": true
+            })))
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+
+        let channel = TelegramChannel::new(
+            "fake-token".into(),
+            "telegram_test_alias",
+            Arc::new(|| vec!["*".into()]),
+            false,
+        )
+        .with_streaming(StreamMode::Partial, 0)
+        .with_api_base(mock_server.uri());
+
+        channel
+            .finalize_draft("123", "42", "complete reply", false)
+            .await
+            .unwrap();
+
+        let requests = mock_server.received_requests().await.unwrap();
+        let methods: Vec<&str> = requests
+            .iter()
+            .map(|request| request.url.path().rsplit('/').next().unwrap())
+            .collect();
+        assert_eq!(
+            methods,
+            vec![
+                "editMessageText",
+                "editMessageText",
+                "sendMessage",
+                "deleteMessage"
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn finalize_draft_preserves_uneditable_draft_when_replacement_send_fails() {
+        use wiremock::matchers::{method, path_regex};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock_server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path_regex(r"/bot[^/]+/editMessageText$"))
+            .respond_with(ResponseTemplate::new(400).set_body_json(serde_json::json!({
+                "ok": false,
+                "description": "Bad Request: message can't be edited"
+            })))
+            .expect(2)
+            .mount(&mock_server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path_regex(r"/bot[^/]+/sendMessage$"))
+            .respond_with(ResponseTemplate::new(500).set_body_json(serde_json::json!({
+                "ok": false,
+                "description": "Internal Server Error"
+            })))
+            .expect(2)
+            .mount(&mock_server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path_regex(r"/bot[^/]+/deleteMessage$"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(0)
+            .mount(&mock_server)
+            .await;
+
+        let channel = TelegramChannel::new(
+            "fake-token".into(),
+            "telegram_test_alias",
+            Arc::new(|| vec!["*".into()]),
+            false,
+        )
+        .with_streaming(StreamMode::Partial, 0)
+        .with_api_base(mock_server.uri());
+
+        let result = channel
+            .finalize_draft("123", "42", "complete reply", false)
+            .await;
+        assert!(result.is_err());
+
+        let requests = mock_server.received_requests().await.unwrap();
+        assert!(
+            requests
+                .iter()
+                .all(|request| !request.url.path().ends_with("/deleteMessage")),
+            "the visible draft must survive a failed replacement send"
+        );
+    }
+
+    #[tokio::test]
+    async fn finalize_draft_delivers_all_text_chunks_before_deleting_draft() {
+        use wiremock::matchers::{method, path_regex};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock_server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path_regex(r"/bot[^/]+/sendMessage$"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "ok": true,
+                "result": { "message_id": 43 }
+            })))
+            .expect(2)
+            .mount(&mock_server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path_regex(r"/bot[^/]+/deleteMessage$"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "ok": true,
+                "result": true
+            })))
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+
+        let channel = TelegramChannel::new(
+            "fake-token".into(),
+            "telegram_test_alias",
+            Arc::new(|| vec!["*".into()]),
+            false,
+        )
+        .with_streaming(StreamMode::Partial, 0)
+        .with_api_base(mock_server.uri());
+        let long_text = "a".repeat(TELEGRAM_MAX_MESSAGE_LENGTH + 64);
+
+        channel
+            .finalize_draft("123", "42", &long_text, false)
+            .await
+            .unwrap();
+
+        let requests = mock_server.received_requests().await.unwrap();
+        let methods: Vec<&str> = requests
+            .iter()
+            .map(|request| request.url.path().rsplit('/').next().unwrap())
+            .collect();
+        assert_eq!(methods, vec!["sendMessage", "sendMessage", "deleteMessage"]);
+    }
+
+    #[tokio::test]
+    async fn finalize_draft_delivers_text_and_attachment_before_deleting_draft() {
+        use wiremock::matchers::{method, path_regex};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock_server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path_regex(r"/bot[^/]+/sendMessage$"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "ok": true,
+                "result": { "message_id": 43 }
+            })))
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path_regex(r"/bot[^/]+/sendPhoto$"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "ok": true,
+                "result": { "message_id": 44 }
+            })))
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path_regex(r"/bot[^/]+/deleteMessage$"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "ok": true,
+                "result": true
+            })))
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+
+        let channel = TelegramChannel::new(
+            "fake-token".into(),
+            "telegram_test_alias",
+            Arc::new(|| vec!["*".into()]),
+            false,
+        )
+        .with_streaming(StreamMode::Partial, 0)
+        .with_api_base(mock_server.uri());
+
+        channel
+            .finalize_draft(
+                "123",
+                "42",
+                "complete reply [IMAGE:https://example.com/image.png]",
+                false,
+            )
+            .await
+            .unwrap();
+
+        let requests = mock_server.received_requests().await.unwrap();
+        let methods: Vec<&str> = requests
+            .iter()
+            .map(|request| request.url.path().rsplit('/').next().unwrap())
+            .collect();
+        assert_eq!(methods, vec!["sendMessage", "sendPhoto", "deleteMessage"]);
     }
 
     #[test]

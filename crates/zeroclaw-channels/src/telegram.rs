@@ -4023,19 +4023,16 @@ impl Channel for TelegramChannel {
             }
         }
 
-        // Truncate to Telegram limit for mid-stream edits (UTF-8 safe)
-        let display_text = if text.len() > TELEGRAM_MAX_MESSAGE_LENGTH {
-            let mut end = 0;
-            for (idx, ch) in text.char_indices() {
-                let next = idx + ch.len_utf8();
-                if next > TELEGRAM_MAX_MESSAGE_LENGTH {
-                    break;
-                }
-                end = next;
-            }
-            &text[..end]
+        // Telegram's limit is Unicode characters, not UTF-8 bytes. Counting
+        // bytes truncates CJK and emoji drafts far below the platform limit.
+        let display_text = if text.chars().count() > TELEGRAM_MAX_MESSAGE_LENGTH {
+            std::borrow::Cow::Owned(
+                text.chars()
+                    .take(TELEGRAM_MAX_MESSAGE_LENGTH)
+                    .collect::<String>(),
+            )
         } else {
-            text
+            std::borrow::Cow::Borrowed(text)
         };
 
         let message_id_parsed = match message_id.parse::<i64>() {
@@ -4057,7 +4054,7 @@ impl Channel for TelegramChannel {
         let body = serde_json::json!({
             "chat_id": chat_id,
             "message_id": message_id_parsed,
-            "text": display_text,
+            "text": display_text.as_ref(),
         });
 
         let resp = self
@@ -4170,9 +4167,10 @@ impl Channel for TelegramChannel {
             return Ok(());
         }
 
-        // If text exceeds the limit, deliver every chunk before removing the
+        // Telegram's limit is Unicode characters, not UTF-8 bytes. If the
+        // reply truly exceeds it, deliver every chunk before removing the
         // draft. A failed chunk send leaves the existing draft visible.
-        if text.len() > TELEGRAM_MAX_MESSAGE_LENGTH {
+        if text.chars().count() > TELEGRAM_MAX_MESSAGE_LENGTH {
             self.send_text_chunks(text, &chat_id, thread_id.as_deref())
                 .await?;
 
@@ -5368,23 +5366,81 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn update_draft_utf8_truncation_is_safe_for_multibyte_text() {
-        let mention_only = false;
+    async fn update_draft_truncates_multibyte_text_at_character_limit() {
+        use wiremock::matchers::{method, path_regex};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock_server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path_regex(r"/bot[^/]+/editMessageText$"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "ok": true,
+                "result": { "message_id": 42 }
+            })))
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+
         let ch = TelegramChannel::new(
             "fake-token".into(),
             "telegram_test_alias",
             Arc::new(|| vec!["*".into()]),
-            mention_only,
+            false,
         )
-        .with_streaming(StreamMode::Partial, 0);
+        .with_streaming(StreamMode::Partial, 0)
+        .with_api_base(mock_server.uri());
         let long_emoji_text = "😀".repeat(TELEGRAM_MAX_MESSAGE_LENGTH + 20);
 
-        // Invalid message_id returns early after building display_text.
-        // This asserts truncation never panics on UTF-8 boundaries.
-        let result = ch
-            .update_draft("123", "not-a-number", &long_emoji_text)
+        ch.update_draft("123", "42", &long_emoji_text)
+            .await
+            .unwrap();
+
+        let requests = mock_server.received_requests().await.unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&requests[0].body).unwrap();
+        let sent_text = body["text"].as_str().unwrap();
+        assert_eq!(sent_text.chars().count(), TELEGRAM_MAX_MESSAGE_LENGTH);
+        assert_eq!(sent_text, "😀".repeat(TELEGRAM_MAX_MESSAGE_LENGTH));
+    }
+
+    #[tokio::test]
+    async fn finalize_draft_edits_multibyte_reply_within_character_limit() {
+        use wiremock::matchers::{method, path_regex};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock_server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path_regex(r"/bot[^/]+/editMessageText$"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "ok": true,
+                "result": { "message_id": 42 }
+            })))
+            .expect(1)
+            .mount(&mock_server)
             .await;
-        assert!(result.is_ok());
+
+        let channel = TelegramChannel::new(
+            "fake-token".into(),
+            "telegram_test_alias",
+            Arc::new(|| vec!["*".into()]),
+            false,
+        )
+        .with_streaming(StreamMode::Partial, 0)
+        .with_api_base(mock_server.uri());
+        let reply = "中".repeat(2_308);
+        assert!(reply.len() > TELEGRAM_MAX_MESSAGE_LENGTH);
+        assert!(reply.chars().count() < TELEGRAM_MAX_MESSAGE_LENGTH);
+
+        channel
+            .finalize_draft("123", "42", &reply, false)
+            .await
+            .unwrap();
+
+        let requests = mock_server.received_requests().await.unwrap();
+        let methods: Vec<&str> = requests
+            .iter()
+            .map(|request| request.url.path().rsplit('/').next().unwrap())
+            .collect();
+        assert_eq!(methods, vec!["editMessageText"]);
     }
 
     #[tokio::test]

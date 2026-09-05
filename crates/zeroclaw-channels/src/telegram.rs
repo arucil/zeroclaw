@@ -1620,7 +1620,16 @@ impl TelegramChannel {
             // ok:true makes a 2xx a successful edit. A truncated body, a
             // proxy-generated 200, a missing or non-boolean ok field would
             // otherwise silently report a card rewrite that never happened.
-            let bytes = resp.bytes().await.unwrap_or_default();
+            let bytes = match resp.bytes().await {
+                Ok(bytes) => bytes,
+                Err(error) => {
+                    return EditMessageResult::Failed {
+                        status,
+                        body: format!("failed to read Telegram response body: {error}"),
+                    };
+                }
+            };
+            let body = String::from_utf8_lossy(&bytes).into_owned();
             let envelope = serde_json::from_slice::<serde_json::Value>(&bytes).ok();
             let ok = envelope
                 .as_ref()
@@ -1636,14 +1645,17 @@ impl TelegramChannel {
                     if description.contains("message is not modified") {
                         return EditMessageResult::NotModified;
                     }
-                    return EditMessageResult::Failed(status);
+                    return EditMessageResult::Failed { status, body };
                 }
                 // missing field, wrong type, unparseable body, read failure
-                None => return EditMessageResult::Failed(status),
+                None => return EditMessageResult::Failed { status, body },
             }
         }
 
-        let body = resp.text().await.unwrap_or_default();
+        let body = match resp.text().await {
+            Ok(body) => body,
+            Err(error) => format!("failed to read Telegram response body: {error}"),
+        };
         if body.contains("message is not modified") {
             return EditMessageResult::NotModified;
         }
@@ -4053,7 +4065,7 @@ Allowlist Telegram username (without '@') or numeric user ID.",
                     .await
                 {
                     Ok(resp) => {
-                        if let EditMessageResult::Failed(status) =
+                        if let EditMessageResult::Failed { status, body } =
                             Self::classify_edit_message_response(resp).await
                         {
                             ::zeroclaw_log::record!(
@@ -4063,7 +4075,10 @@ Allowlist Telegram username (without '@') or numeric user ID.",
                                     ::zeroclaw_log::Action::Note
                                 )
                                 .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
-                                .with_attrs(::serde_json::json!({"status": status.to_string()})),
+                                .with_attrs(::serde_json::json!({
+                                    "status": status.to_string(),
+                                    "error": zeroclaw_runtime::security::scrub(&body),
+                                })),
                                 "editMessageText (approval resolution) failed"
                             );
                         }
@@ -12542,10 +12557,11 @@ mod tests {
             .await
             .unwrap();
         let classified = TelegramChannel::classify_edit_message_response(resp).await;
-        assert_eq!(
-            classified,
-            EditMessageResult::Failed(reqwest::StatusCode::OK)
-        );
+        let EditMessageResult::Failed { status, body } = classified else {
+            panic!("expected failed edit classification");
+        };
+        assert_eq!(status, reqwest::StatusCode::OK);
+        assert!(body.contains("message to edit not found"));
     }
 
     #[tokio::test]
@@ -12650,10 +12666,11 @@ mod tests {
             .await
             .unwrap();
         let classified = TelegramChannel::classify_edit_message_response(resp).await;
-        assert_eq!(
-            classified,
-            EditMessageResult::Failed(reqwest::StatusCode::OK)
-        );
+        let EditMessageResult::Failed { status, body } = classified else {
+            panic!("expected failed edit classification");
+        };
+        assert_eq!(status, reqwest::StatusCode::OK);
+        assert!(body.contains("\"result\""));
     }
 
     #[tokio::test]
@@ -12687,10 +12704,11 @@ mod tests {
             .await
             .unwrap();
         let classified = TelegramChannel::classify_edit_message_response(resp).await;
-        assert_eq!(
-            classified,
-            EditMessageResult::Failed(reqwest::StatusCode::OK)
-        );
+        let EditMessageResult::Failed { status, body } = classified else {
+            panic!("expected failed edit classification");
+        };
+        assert_eq!(status, reqwest::StatusCode::OK);
+        assert_eq!(body, "truncated 200 {\"ok\":");
     }
 
     #[tokio::test]

@@ -121,7 +121,7 @@ async fn finalize_draft_plain_retry_treats_not_modified_as_success() {
 }
 
 #[tokio::test]
-async fn finalize_draft_skips_send_message_when_delete_fails() {
+async fn finalize_draft_delivers_replacement_before_delete_failure() {
     let server = MockServer::start().await;
 
     Mock::given(method("POST"))
@@ -132,6 +132,13 @@ async fn finalize_draft_skips_send_message_when_delete_fails() {
             )),
         )
         .expect(2)
+        .mount(&server)
+        .await;
+
+    Mock::given(method("POST"))
+        .and(path("/botTEST_TOKEN/sendMessage"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(telegram_ok_response(43)))
+        .expect(1)
         .mount(&server)
         .await;
 
@@ -153,7 +160,7 @@ async fn finalize_draft_skips_send_message_when_delete_fails() {
 
     assert!(
         result.is_ok(),
-        "delete failure should skip sendMessage instead of erroring, got: {result:?}"
+        "delete failure after replacement delivery should be non-fatal, got: {result:?}"
     );
 
     let requests = server
@@ -163,15 +170,20 @@ async fn finalize_draft_skips_send_message_when_delete_fails() {
     assert_eq!(
         requests
             .iter()
-            .filter(|req| req.url.path() == "/botTEST_TOKEN/sendMessage")
-            .count(),
-        0,
-        "sendMessage should be skipped when deleteMessage fails"
+            .map(|request| request.url.path().rsplit('/').next().unwrap())
+            .collect::<Vec<_>>(),
+        vec![
+            "editMessageText",
+            "editMessageText",
+            "sendMessage",
+            "deleteMessage"
+        ],
+        "the replacement must be visible before draft cleanup is attempted"
     );
 }
 
 #[tokio::test]
-async fn finalize_draft_sends_fresh_message_after_successful_delete() {
+async fn finalize_draft_sends_fresh_message_before_successful_delete() {
     let server = MockServer::start().await;
 
     Mock::given(method("POST"))
@@ -216,9 +228,14 @@ async fn finalize_draft_sends_fresh_message_after_successful_delete() {
     assert_eq!(
         requests
             .iter()
-            .filter(|req| req.url.path() == "/botTEST_TOKEN/sendMessage")
-            .count(),
-        1,
-        "sendMessage should be attempted exactly once after delete succeeds"
+            .map(|request| request.url.path().rsplit('/').next().unwrap())
+            .collect::<Vec<_>>(),
+        vec![
+            "editMessageText",
+            "editMessageText",
+            "sendMessage",
+            "deleteMessage"
+        ],
+        "draft cleanup must happen only after replacement delivery"
     );
 }

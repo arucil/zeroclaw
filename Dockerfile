@@ -91,6 +91,9 @@ COPY vendor/ vendor/
 # WIT contract during compilation. Keep this before the dependency prefetch so
 # plugin-enabled builds have the same ABI input in both builder invocations.
 COPY wit/ wit/
+# Root-level fixture crates are workspace members too. Keep their manifests
+# and targets available during dependency prefetch and the final build.
+COPY tests/fixtures/ tests/fixtures/
 # Copy every workspace-member manifest in one glob — adding or removing a crate
 # no longer requires editing this file.  --parents preserves the
 # crates/<name>/Cargo.toml directory structure.

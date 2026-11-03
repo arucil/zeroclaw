@@ -53,6 +53,9 @@ COPY vendor/ vendor/
 # WIT contract during compilation. Keep it in this persistent builder before
 # both the dependency prefetch and the real source build.
 COPY wit/ wit/
+# Root-level fixture crates are workspace members too. Keep their manifests
+# and targets available during dependency prefetch and the final build.
+COPY tests/fixtures/ tests/fixtures/
 COPY --parents crates/*/Cargo.toml ./
 COPY --parents crates/*/tests/fixtures/*/Cargo.toml ./
 COPY --parents crates/zeroclaw-macros/src/ ./

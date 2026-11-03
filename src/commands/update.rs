@@ -2450,6 +2450,37 @@ mod tests {
         assert!(!tmp.path().join("escape.txt").exists());
     }
 
+    /// GHSA-m665-v7pm-7grj concerns mixing central-directory validation with
+    /// local-header extraction. Keep both decisions on the central directory.
+    #[test]
+    fn unpack_zip_uses_central_directory_consistently() {
+        let name = b"zeroclaw.exe";
+        let mut zip_buf = make_zip(&[("zeroclaw.exe", b"binary")]);
+        let local_name = zip_buf
+            .windows(name.len())
+            .position(|bytes| bytes == name)
+            .unwrap();
+        let central_name = zip_buf
+            .windows(name.len())
+            .rposition(|bytes| bytes == name)
+            .unwrap();
+        assert_ne!(local_name, central_name);
+        zip_buf[local_name..local_name + name.len()].copy_from_slice(b"startup.conf");
+
+        let tmp = tempfile::tempdir().unwrap();
+        let staging = tmp.path().join("staging");
+        std::fs::create_dir_all(&staging).unwrap();
+        let existing = staging.join("startup.conf");
+        std::fs::write(&existing, b"existing configuration").unwrap();
+
+        unpack_zip(&zip_buf, &staging).unwrap();
+        assert_eq!(
+            std::fs::read(staging.join("zeroclaw.exe")).unwrap(),
+            b"binary"
+        );
+        assert_eq!(std::fs::read(existing).unwrap(), b"existing configuration");
+    }
+
     #[tokio::test]
     async fn ensure_install_dir_writable_accepts_writable_dir() {
         let tmp = tempfile::tempdir().unwrap();

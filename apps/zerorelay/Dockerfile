@@ -17,9 +17,19 @@
 # --registration-mode open|allowlist with --allow/--deny keyed on the daemon pubkey
 # FINGERPRINT (sha256 hex), plus an optional shared-secret gate via --relay-token.
 
+# >>> generated:base-arg-rust-slim from dev/ci/container-base-images.toml by `cargo generate installers` - do not edit <<<
+ARG ZEROCLAW_BASE_RUST_SLIM=rust:1.98-slim@sha256:4cd829461bd5c4d511c32e269da9cb8929223b666519d8004e35fc8d1d771ab7
+# >>> end generated:base-arg-rust-slim <<<
+# >>> generated:base-arg-distroless from dev/ci/container-base-images.toml by `cargo generate installers` - do not edit <<<
+ARG ZEROCLAW_BASE_DISTROLESS=gcr.io/distroless/cc-debian13:nonroot@sha256:b7e81cb1af38d9345680e68bcf564d388f96304e25222030fc8c051faf8565b3
+# >>> end generated:base-arg-distroless <<<
+
 # --- Stage 1: build only the relay binary ---
-FROM rust:1.98-slim AS builder
+FROM ${ZEROCLAW_BASE_RUST_SLIM} AS builder
 WORKDIR /app
+# No `.git` in the build context (`.dockerignore`); the commit is passed in here.
+ARG ZEROCLAW_BUILD_ID=""
+ENV ZEROCLAW_BUILD_ID=${ZEROCLAW_BUILD_ID}
 COPY . .
 RUN --mount=type=cache,id=zeroclaw-cargo-registry,target=/usr/local/cargo/registry,sharing=locked \
     --mount=type=cache,id=zeroclaw-cargo-git,target=/usr/local/cargo/git,sharing=locked \
@@ -33,7 +43,7 @@ RUN --mount=type=cache,id=zeroclaw-cargo-registry,target=/usr/local/cargo/regist
 RUN mkdir -p /seed/data && chown -R 65532:65532 /seed/data
 
 # --- Stage 2: minimal distroless runtime (no shell) ---
-FROM gcr.io/distroless/cc-debian13:nonroot AS runtime
+FROM ${ZEROCLAW_BASE_DISTROLESS} AS runtime
 COPY --from=builder /usr/local/bin/zerorelay /usr/local/bin/zerorelay
 # /data must exist in the image owned by nonroot (65532) or a fresh named
 # volume mounts root-owned and self-provisioning fails with

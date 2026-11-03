@@ -174,29 +174,23 @@ fn handle_request(server: &EnrollServer, request: PaircodeRequest) -> PaircodeRe
         };
     }
 
-    match server.pairing.generate_new_pairing_code() {
-        Some(code) => match sas_for_code(&server.ca_cert_pem, &code) {
-            Ok(sas) => PaircodeResponse {
-                id: request.id,
-                success: true,
-                pairing_code: Some(code),
-                sas: Some(sas),
-                message: "New enrollment pairing code generated".to_string(),
-            },
-            Err(error) => PaircodeResponse {
-                id: request.id,
-                success: false,
-                pairing_code: None,
-                sas: None,
-                message: format!("could not compute enrollment SAS: {error:#}"),
-            },
+    let code = server
+        .pairing
+        .mint_enrollment_code((server.pairing_code_policy)());
+    match sas_for_code(&server.ca_cert_pem, &code) {
+        Ok(sas) => PaircodeResponse {
+            id: request.id,
+            success: true,
+            pairing_code: Some(code),
+            sas: Some(sas),
+            message: "New enrollment pairing code generated".to_string(),
         },
-        None => PaircodeResponse {
+        Err(error) => PaircodeResponse {
             id: request.id,
             success: false,
             pairing_code: None,
             sas: None,
-            message: "enrollment pairing is disabled".to_string(),
+            message: format!("could not compute enrollment SAS: {error:#}"),
         },
     }
 }
@@ -243,7 +237,7 @@ fn now_unix() -> i64 {
 mod tests {
     use std::sync::Arc;
 
-    use zeroclaw_config::pairing::PairingGuard;
+    use zeroclaw_config::pairing::{PairingCodePolicy, PairingGuard};
 
     use super::*;
     use crate::enroll::RelayProfile;
@@ -272,6 +266,7 @@ mod tests {
             ca_key_pem: zeroize::Zeroizing::new(ca_key),
             ledger: Arc::new(CertLedger::open_in_memory(None).unwrap()),
             pairing: Arc::new(pairing),
+            pairing_code_policy: Arc::new(PairingCodePolicy::default),
             static_client_pins_configured: false,
             allow_unpaired_until: None,
             relay_profile: RelayProfile::default(),
@@ -285,7 +280,11 @@ mod tests {
     async fn running_loop_mints_additional_code_without_restart() {
         let _ = rustls::crypto::ring::default_provider().install_default();
         let data_dir = tempfile::tempdir().unwrap();
-        let pairing = PairingGuard::new(true, &[String::from("already-paired-token")]);
+        let pairing = PairingGuard::new(
+            true,
+            &[String::from("already-paired-token")],
+            PairingCodePolicy::default(),
+        );
         assert!(pairing.pairing_code().is_none());
 
         let server = test_server(pairing.clone());
@@ -298,20 +297,77 @@ mod tests {
             .await
             .unwrap();
         assert!(!generated.pairing_code.trim().is_empty());
-        assert_eq!(
-            pairing.pairing_code().as_deref(),
-            Some(generated.pairing_code.as_str())
+        assert!(
+            pairing.pairing_code().is_none(),
+            "an enrollment code is not a gateway pairing code"
         );
 
         let reservation = pairing
-            .reserve_pair(&generated.pairing_code, "test-device")
+            .reserve_enrollment(&generated.pairing_code, "test-device")
             .await
             .unwrap()
             .expect("freshly minted code should be redeemable");
-        reservation.commit();
-        assert!(pairing.pairing_code().is_none());
+        reservation.consume();
+        assert!(
+            pairing
+                .reserve_enrollment_unkeyed(&generated.pairing_code)
+                .await
+                .is_none(),
+            "the code is one-time"
+        );
 
         cancel.cancel();
         loop_handle.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn minting_leaves_a_pending_gateway_code_redeemable() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let pairing = PairingGuard::new(true, &[], PairingCodePolicy::default());
+        let gateway = pairing.pairing_code().expect("startup code");
+        let server = test_server(pairing.clone());
+        let response = handle_request(
+            &server,
+            PaircodeRequest {
+                id: "req".into(),
+                action: "new".into(),
+                created_at_unix: 0,
+            },
+        );
+        assert!(response.success, "{}", response.message);
+        assert_ne!(response.pairing_code.as_deref(), Some(gateway.as_str()));
+        assert!(
+            pairing
+                .try_pair(&gateway, "198.51.100.7")
+                .await
+                .unwrap()
+                .is_some(),
+            "enroll-paircode --new must not cancel the gateway's pending code"
+        );
+    }
+
+    #[tokio::test]
+    async fn mints_an_enrollment_code_when_gateway_pairing_is_disabled() {
+        // Enrollment always requires a code, so `require_pairing = false` on
+        // the shared guard must not turn `enroll-paircode --new` into an error.
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let pairing = PairingGuard::new(false, &[], PairingCodePolicy::default());
+        let server = test_server(pairing.clone());
+        let response = handle_request(
+            &server,
+            PaircodeRequest {
+                id: "req".into(),
+                action: "new".into(),
+                created_at_unix: 0,
+            },
+        );
+        assert!(response.success, "{}", response.message);
+        let code = response.pairing_code.expect("a code is returned");
+        pairing
+            .reserve_enrollment(&code, "test-device")
+            .await
+            .unwrap()
+            .expect("the minted code enrolls")
+            .consume();
     }
 }
